@@ -39,7 +39,7 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 - (UIImage *)urb_applyBlurWithRadius:(CGFloat)blurRadius tintColor:(UIColor *)tintColor saturationDeltaFactor:(CGFloat)saturationDeltaFactor maskImage:(UIImage *)maskImage;
 @end
 
-@interface URBMediaFocusViewController () <UIScrollViewDelegate, UIActionSheetDelegate>
+@interface URBMediaFocusViewController () <UIScrollViewDelegate>
 
 @property (nonatomic, strong) UIView *fromView;
 @property (nonatomic, assign) CGRect fromRect;
@@ -63,8 +63,7 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 @property (nonatomic, strong) UILongPressGestureRecognizer *photoLongPressRecognizer;
 
 @property (nonatomic, strong) UIActivityIndicatorView *loadingView;
-@property (nonatomic, strong) NSURLConnection *urlConnection;
-@property (nonatomic, strong) NSMutableData *urlData;
+@property (nonatomic, strong) NSURLSessionDataTask *downloadTask;
 
 @property (nonatomic, strong) UIImageView *blurredSnapshotView;
 @property (nonatomic, strong) UIView *snapshotView;
@@ -79,27 +78,24 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	CGFloat _lastZoomScale;
 	UIInterfaceOrientation _currentOrientation;
 	BOOL _hasLaidOut;
-	BOOL _unhideStatusBarOnDismiss;
 	BOOL _hasGeneratedBlurBackground;
 }
 
 - (void)dealloc {
 	self.delegate = nil;
-	[self.urlConnection cancel];
+  if (self.downloadTask) [self.downloadTask cancel];
 }
 
 - (id)init {
 	self = [super init];
 	if (self) {
 		_hasLaidOut = NO;
-		_unhideStatusBarOnDismiss = YES;
 		_hasGeneratedBlurBackground = NO;
 		
 		self.shouldBlurBackground = YES;
 		self.parallaxEnabled = YES;
 		self.shouldDismissOnTap = YES;
 		self.shouldDismissOnImageTap = NO;
-		self.shouldShowPhotoActions = NO;
 		self.shouldRotateToDeviceOrientation = YES;
 		self.allowSwipeOnBackgroundView = YES;
 	}
@@ -161,13 +157,6 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	[self.tapRecognizer requireGestureRecognizerToFail:self.doubleTapRecognizer];
 	[self.view addGestureRecognizer:self.tapRecognizer];
 	
-	// long press gesture recognizer to bring up photo actions (when `shouldShowPhotoActions` is set to YES)
-	if (self.shouldShowPhotoActions) {
-		self.photoLongPressRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPressGesture:)];
-		self.photoLongPressRecognizer.delegate = self;
-		[self.imageView addGestureRecognizer:self.photoLongPressRecognizer];
-	}
-	
 	// only add pan gesture and physics stuff if we can (e.g., iOS 7+)
 	if (NSClassFromString(@"UIDynamicAnimator")) {
 		// pan gesture to handle the physics
@@ -216,7 +205,7 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
         [self.loadingView stopAnimating];
         if (self.loadingView.superview) [self.loadingView removeFromSuperview];
     }
-    if (self.urlConnection) [self.urlConnection cancel];
+    if (self.downloadTask) [self.downloadTask cancel];
 };
 
 #pragma mark - Presenting and Dismissing
@@ -234,6 +223,10 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	[self showImage:image fromRect:fromRect];
 }
 
+- (BOOL)prefersStatusBarHidden {
+  return TRUE;
+}
+
 - (void)showImage:(UIImage *)image fromRect:(CGRect)fromRect {
 	[self view]; // make sure view has loaded first
 	_currentOrientation = [UIApplication sharedApplication].statusBarOrientation;
@@ -249,15 +242,6 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	// create snapshot of background if parallax is enabled
 	if (self.parallaxEnabled || self.shouldBlurBackground) {
 		[self createViewsForBackground:NULL];
-		
-		// hide status bar, but store whether or not we need to unhide it later when dismissing this view
-		// NOTE: in iOS 7+, this only works if you set `UIViewControllerBasedStatusBarAppearance` to NO in your Info.plist
-		_unhideStatusBarOnDismiss = ![UIApplication sharedApplication].statusBarHidden;
-		[[UIApplication sharedApplication] setStatusBarHidden:YES withAnimation:UIStatusBarAnimationNone];
-		
-		if ([self respondsToSelector:@selector(setNeedsStatusBarAppearanceUpdate)]) {
-			[self setNeedsStatusBarAppearanceUpdate];
-		}
 	}
 	
 	// update scrollView.contentSize to the size of the image
@@ -378,9 +362,6 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 		}
 	}
 	
-	// stores data as it's loaded from the request
-	self.urlData = [[NSMutableData alloc] init];
-	
 	// show loading indicator on fromView
 	if (!self.loadingView) {
 		self.loadingView = [[UIActivityIndicatorView alloc] initWithFrame:CGRectMake(0, 0, 30.0, 30.0)];
@@ -391,8 +372,54 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	}
 	[self.loadingView startAnimating];
 	
-	NSURLConnection *connection = [[NSURLConnection alloc] initWithRequest:request delegate:self];
-	self.urlConnection = connection;
+  NSURLSession *session = [NSURLSession sharedSession];
+  
+  self.downloadTask = [session dataTaskWithRequest:request
+                                          completionHandler:
+                                ^(NSData *data, NSURLResponse *response, NSError *error) {
+                                  
+                                  if (error == NULL) {
+
+                                     dispatch_async(dispatch_get_main_queue(), ^{
+                                       [self.loadingView stopAnimating];
+                                       [self.loadingView removeFromSuperview];
+                                     });
+                                    
+                                    if (data) {
+                                      __block UIImage *image;
+                                      
+                                      dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                                          image = [UIImage imageWithData:data];
+                                        
+                                        dispatch_async(dispatch_get_main_queue(), ^{
+                                          // sometimes the server can return bad or corrupt image data which will result in a crash if we don't throw an error here
+                                          if (!image) {
+                                            NSString *errorDescription = [NSString stringWithFormat:@"Bad or corrupt image data for %@", url.absoluteString];
+                                            NSError *error = [NSError errorWithDomain:@"com.urban10.URBMediaFocusViewController" code:100 userInfo:@{NSLocalizedDescriptionKey: errorDescription}];
+                                            if ([self.delegate respondsToSelector:@selector(mediaFocusViewController:didFailLoadingImageWithError:)]) {
+                                              [self.delegate mediaFocusViewController:self didFailLoadingImageWithError:error];
+                                            }
+                                            return;
+                                          }
+
+                                          
+                                          [self showImage:image fromRect:self.fromRect];
+                                          
+                                          if ([self.delegate respondsToSelector:@selector(mediaFocusViewController:didFinishLoadingImage:)]) {
+                                            [self.delegate mediaFocusViewController:self didFinishLoadingImage:image];
+                                          }
+                                        });
+                                      });
+                                    }
+                                  } else {
+                                    if ([self.delegate respondsToSelector:@selector(mediaFocusViewController:didFailLoadingImageWithError:)]) {
+                                      [self.delegate mediaFocusViewController:self didFailLoadingImageWithError:error];
+                                    }
+                                  }
+                                  
+                                }];
+  
+  [self.downloadTask resume];
 }
 
 - (void)dismiss:(BOOL)animated {
@@ -478,7 +505,7 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	return rect;
 }
 
-- (void)createViewsForBackground:(void (^)())completionBlock {
+- (void)createViewsForBackground:(void (^)(void))completionBlock {
 	// container view for window
 	CGRect containerFrame = CGRectMake(0, 0, CGRectGetWidth(self.keyWindow.frame), CGRectGetHeight(self.keyWindow.frame));
 	
@@ -579,15 +606,11 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	}
 	[UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
 		self.imageView.transform = CGAffineTransformIdentity;
-		self.imageView.frame = _originalFrame;
+    self.imageView.frame = self->_originalFrame;
 	} completion:nil];
 }
 
 - (void)hideSnapshotView {
-	// only unhide status bar if it wasn't hidden before this view appeared
-	if (_unhideStatusBarOnDismiss) {
-		[[UIApplication sharedApplication] setStatusBarHidden:NO withAnimation:UIStatusBarAnimationNone];
-	}
 	
 	[UIView animateWithDuration:__animationDuration delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
 		self.blurredSnapshotView.alpha = 0.0f;
@@ -635,24 +658,6 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	if ([self respondsToSelector:@selector(setNeedsStatusBarAppearanceUpdate)]) {
 		[self setNeedsStatusBarAppearanceUpdate];
 	}
-}
-
-- (void)saveImageToLibrary:(UIImage *)image {
-	ALAssetsLibrary *library = [[ALAssetsLibrary alloc] init];
-	[library writeImageToSavedPhotosAlbum:image.CGImage orientation:(ALAssetOrientation)image.imageOrientation completionBlock:^(NSURL *assetURL, NSError *error) {
-		if (error) {
-			UIAlertView *alertView = [[UIAlertView alloc] initWithTitle:error.localizedDescription
-																message:error.localizedRecoverySuggestion
-															   delegate:nil
-													  cancelButtonTitle:NSLocalizedString(@"OK", nil)
-													  otherButtonTitles:nil];
-			[alertView show];
-		}
-	}];
-}
-
-- (void)copyImage:(UIImage *)image {
-	[UIPasteboard generalPasteboard].image = image;
 }
 
 #pragma mark - Gesture Methods
@@ -774,18 +779,7 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
         return;
 	}
 }
-
-- (void)handleLongPressGesture:(UILongPressGestureRecognizer *)gestureRecognizer {
-	if (gestureRecognizer.state == UIGestureRecognizerStateBegan) {
-		UIActionSheet *actionSheet = [[UIActionSheet alloc] initWithTitle:nil
-																 delegate:self
-														cancelButtonTitle:NSLocalizedString(@"Cancel", nil)
-												   destructiveButtonTitle:nil
-														otherButtonTitles:NSLocalizedString(@"Save Photo", nil), NSLocalizedString(@"Copy Photo", nil), nil];
-		[actionSheet showInView:self.view];
-	}
-}
-
+  
 - (void)enablePanGesture:(BOOL)enabled {
 	if (!self.panRecognizer) {
 		return;
@@ -837,17 +831,6 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	}
 }
 
-#pragma mark - UIActionSheetDelegate
-
-- (void)actionSheet:(UIActionSheet *)actionSheet clickedButtonAtIndex:(NSInteger)buttonIndex {
-	if (buttonIndex == 0) {
-		[self saveImageToLibrary:self.imageView.image];
-	}
-	else if (buttonIndex == 1) {
-		[self copyImage:self.imageView.image];
-	}
-}
-
 #pragma mark - UIGestureRecognizerDelegate Methods
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
@@ -858,63 +841,6 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
 	shouldRecognize = shouldRecognize && !([gestureRecognizer isKindOfClass:[UITapGestureRecognizer class]] && [otherGestureRecognizer isKindOfClass:[UITapGestureRecognizer class]]);
 	
 	return shouldRecognize;
-}
-
-#pragma mark - NSURLConnectionDelegate
-
-- (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data {
-	[self.urlData appendData:data];
-}
-
-- (void)connectionDidFinishLoading:(NSURLConnection *)connection {
-	[self.loadingView stopAnimating];
-	[self.loadingView removeFromSuperview];
-	
-	if (self.urlData) {
-		NSString *urlPath = connection.currentRequest.URL.absoluteString;
-		__block UIImage *image;
-		__block UIImage *staticImageForGif;
-		
-		dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-			// determine if the loaded url is an animated GIF, and setup accordingly if so
-			if ([[urlPath substringFromIndex:[urlPath length] - 3] isEqualToString:@"gif"]) {
-				staticImageForGif = [UIImage imageWithData:self.urlData];
-				image = [UIImage urb_animatedImageWithAnimatedGIFData:self.urlData];
-			}
-			else {
-				image = [UIImage imageWithData:self.urlData];
-			}
-			
-			dispatch_async(dispatch_get_main_queue(), ^{
-				// sometimes the server can return bad or corrupt image data which will result in a crash if we don't throw an error here
-				if (!image) {
-					NSString *errorDescription = [NSString stringWithFormat:@"Bad or corrupt image data for %@", urlPath];
-					NSError *error = [NSError errorWithDomain:@"com.urban10.URBMediaFocusViewController" code:100 userInfo:@{NSLocalizedDescriptionKey: errorDescription}];
-					if ([self.delegate respondsToSelector:@selector(mediaFocusViewController:didFailLoadingImageWithError:)]) {
-						[self.delegate mediaFocusViewController:self didFailLoadingImageWithError:error];
-					}
-					return;
-				}
-				
-				// set the initial image to the static version of the GIF for the present animation
-				if (staticImageForGif) {
-					self.imageView.image = staticImageForGif;
-				}
-				
-				[self showImage:image fromRect:self.fromRect];
-				
-				if ([self.delegate respondsToSelector:@selector(mediaFocusViewController:didFinishLoadingImage:)]) {
-					[self.delegate mediaFocusViewController:self didFinishLoadingImage:image];
-				}
-			});
-		});
-	}
-}
-
-- (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error {
-	if ([self.delegate respondsToSelector:@selector(mediaFocusViewController:didFailLoadingImageWithError:)]) {
-		[self.delegate mediaFocusViewController:self didFailLoadingImageWithError:error];
-	}
 }
 
 #pragma mark - Orientation Helpers
@@ -1258,138 +1184,6 @@ static const CGFloat __blurTintColorAlpha = 0.2f;				// defines how much to tint
     UIGraphicsEndImageContext();
 	
     return outputImage;
-}
-
-@end
-
-
-@import ImageIO;
-
-#if __has_feature(objc_arc)
-#define toCF (__bridge CFTypeRef)
-#define fromCF (__bridge id)
-#else
-#define toCF (CFTypeRef)
-#define fromCF (id)
-#endif
-
-/**
- *  Animated GIF category and utility methods from https://github.com/mayoff/uiimage-from-animated-gif
- */
-@implementation UIImage (URBAnimatedGIF)
-
-static int delayCentisecondsForImageAtIndex(CGImageSourceRef const source, size_t const i) {
-    int delayCentiseconds = 1;
-    CFDictionaryRef const properties = CGImageSourceCopyPropertiesAtIndex(source, i, NULL);
-    if (properties) {
-        CFDictionaryRef const gifProperties = CFDictionaryGetValue(properties, kCGImagePropertyGIFDictionary);
-        if (gifProperties) {
-            NSNumber *number = fromCF CFDictionaryGetValue(gifProperties, kCGImagePropertyGIFUnclampedDelayTime);
-            if (number == NULL || [number doubleValue] == 0) {
-                number = fromCF CFDictionaryGetValue(gifProperties, kCGImagePropertyGIFDelayTime);
-            }
-            if ([number doubleValue] > 0) {
-                // Even though the GIF stores the delay as an integer number of centiseconds, ImageIO “helpfully” converts that to seconds for us.
-                delayCentiseconds = (int)lrint([number doubleValue] * 100);
-            }
-        }
-        CFRelease(properties);
-    }
-    return delayCentiseconds;
-}
-
-static void createImagesAndDelays(CGImageSourceRef source, size_t count, CGImageRef imagesOut[count], int delayCentisecondsOut[count]) {
-    for (size_t i = 0; i < count; ++i) {
-        imagesOut[i] = CGImageSourceCreateImageAtIndex(source, i, NULL);
-        delayCentisecondsOut[i] = delayCentisecondsForImageAtIndex(source, i);
-    }
-}
-
-static int sum(size_t const count, int const *const values) {
-    int theSum = 0;
-    for (size_t i = 0; i < count; ++i) {
-		theSum += values[i];
-    }
-	
-    return theSum;
-}
-
-static int pairGCD(int a, int b) {
-    if (a < b) {
-		return pairGCD(b, a);
-	}
-	
-    while (true) {
-		int const r = a % b;
-		if (r == 0) {
-			return b;
-		}
-		
-		a = b;
-		b = r;
-    }
-}
-
-static int vectorGCD(size_t const count, int const *const values) {
-    int gcd = values[0];
-    for (size_t i = 1; i < count; ++i) {
-		// Note that after I process the first few elements of the vector, `gcd` will probably be smaller than any remaining element.  By passing the smaller value as the second argument to `pairGCD`, I avoid making it swap the arguments.
-		gcd = pairGCD(values[i], gcd);
-    }
-	
-    return gcd;
-}
-
-static NSArray *frameArray(size_t const count, CGImageRef const images[count], int const delayCentiseconds[count], int const totalDurationCentiseconds) {
-	int const gcd = vectorGCD(count, delayCentiseconds);
-	size_t const frameCount = totalDurationCentiseconds / gcd;
-	UIImage *frames[frameCount];
-	for (size_t i = 0, f = 0; i < count; ++i) {
-		UIImage *const frame = [UIImage imageWithCGImage:images[i]];
-		for (size_t j = delayCentiseconds[i] / gcd; j > 0; --j) {
-			frames[f++] = frame;
-		}
-	}
-	
-	return [NSArray arrayWithObjects:frames count:frameCount];
-}
-
-static void releaseImages(size_t const count, CGImageRef const images[count]) {
-	for (size_t i = 0; i < count; ++i) {
-		CGImageRelease(images[i]);
-    }
-}
-
-static UIImage *animatedImageWithAnimatedGIFImageSource(CGImageSourceRef const source) {
-	size_t const count = CGImageSourceGetCount(source);
-	CGImageRef images[count];
-	int delayCentiseconds[count]; // in centiseconds
-	createImagesAndDelays(source, count, images, delayCentiseconds);
-	int const totalDurationCentiseconds = sum(count, delayCentiseconds);
-	NSArray *const frames = frameArray(count, images, delayCentiseconds, totalDurationCentiseconds);
-	UIImage *const animation = [UIImage animatedImageWithImages:frames duration:(NSTimeInterval)totalDurationCentiseconds / 100.0];
-	releaseImages(count, images);
-	
-	return animation;
-}
-
-static UIImage *animatedImageWithAnimatedGIFReleasingImageSource(CGImageSourceRef source) {
-	if (source) {
-		UIImage *const image = animatedImageWithAnimatedGIFImageSource(source);
-		CFRelease(source);
-		return image;
-	}
-	else {
-		return nil;
-	}
-}
-
-+ (UIImage *)urb_animatedImageWithAnimatedGIFData:(NSData *)data {
-	return animatedImageWithAnimatedGIFReleasingImageSource(CGImageSourceCreateWithData(toCF data, NULL));
-}
-
-+ (UIImage *)urb_animatedImageWithAnimatedGIFURL:(NSURL *)url {
-	return animatedImageWithAnimatedGIFReleasingImageSource(CGImageSourceCreateWithURL(toCF url, NULL));
 }
 
 @end
