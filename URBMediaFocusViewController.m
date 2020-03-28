@@ -8,7 +8,6 @@
 
 #import <Accelerate/Accelerate.h>
 #import <QuartzCore/QuartzCore.h>
-#import <AssetsLibrary/AssetsLibrary.h>
 
 #import "URBMediaFocusViewController.h"
 
